@@ -716,6 +716,17 @@ function weekdayName(dateStr){
   return ['Domingo','Segunda','Terça','Quarta','Quinta','Sexta','Sábado'][d.getDay()];
 }
 
+// Um motorista/entidade "desativado a partir de" uma data continua a
+// aparecer (e a contar) em todos os dias/meses ANTERIORES a essa data, mas
+// deixa de aparecer no formulário de Registo a partir dela (inclusive o
+// próprio dia da desativação ainda o mostra, para fechar esse dia).
+function isEntityActiveForDate(op, ent, dateStr){
+  if (!op.repeating) return true;
+  const meta = (op.repeating.entityMeta||{})[ent] || {};
+  if (!meta.inactiveFrom) return true;
+  return dateStr <= meta.inactiveFrom;
+}
+
 // ============================================================
 // RENDER: TABS
 // ============================================================
@@ -739,6 +750,25 @@ let registoSel = { opId: null, date: todayISO() };
 let registoDrafts = {};
 let lastSavedVerify = null;
 function draftKey(){ return registoSel.opId+'|'+registoSel.date; }
+
+// ------------------------------------------------------------
+// AUTO-SAVE + AVISO AO SAIR SEM GUARDAR
+// registoDrafts guarda alterações feitas mas ainda não confirmadas no
+// Firebase. Enquanto existir pelo menos um rascunho por guardar:
+//  1) tentamos guardar sozinhos ao fim de alguns segundos sem digitar
+//     (ver scheduleAutosave dentro de renderRegisto)
+//  2) e, como rede de segurança, avisamos antes de fechar/recarregar a
+//     página, caso o auto-save ainda não tenha tido tempo de correr.
+// ------------------------------------------------------------
+let autosaveTimer = null;
+function hasUnsavedDrafts(){ return Object.keys(registoDrafts).length > 0; }
+window.addEventListener('beforeunload', function(e){
+  if (hasUnsavedDrafts()){
+    e.preventDefault();
+    e.returnValue = 'Tens alterações por guardar. Sair agora vai perdê-las. Queres mesmo sair?';
+    return e.returnValue;
+  }
+});
 
 function renderFechoBanner(op, fixedVals, entityVals){
   function roleTotal(role){
@@ -888,6 +918,7 @@ function renderRegisto(){
       const absences = (rec && rec.absences) || {};
       const entities = (rec && rec.entities) || {};
       return op.repeating.entities.filter(ent=>{
+        if (!isEntityActiveForDate(op, ent, d)) return false;
         if (absences[ent]) return false;
         const ev = entities[ent];
         return !ev || !Object.keys(ev).length;
@@ -1075,8 +1106,9 @@ function renderRegisto(){
     const hasNaoEntreguesField = op.repeating.fields.some(f=>f.role==='nao_entregues');
     const showComputed = hasEntreguesField && (hasTotalField || hasNaoEntreguesField);
     const showDerivedNaoEnt = hasEntreguesField && hasTotalField && !hasNaoEntreguesField;
-    const historicalOnly = Object.keys(formVals.entities).filter(e=>!op.repeating.entities.includes(e) && Object.keys(formVals.entities[e]||{}).length);
-    const displayEntities = [...op.repeating.entities, ...historicalOnly];
+    const activeForDate = op.repeating.entities.filter(ent=>isEntityActiveForDate(op, ent, registoSel.date));
+    const historicalOnly = Object.keys(formVals.entities).filter(e=>!activeForDate.includes(e) && Object.keys(formVals.entities[e]||{}).length);
+    const displayEntities = [...activeForDate, ...historicalOnly];
     table.innerHTML = `<thead><tr>
         <th>${op.repeating.entityLabel}</th>
         ${hasLojas?'<th>Loja</th>':''}
@@ -1084,6 +1116,7 @@ function renderRegisto(){
         ${showDerivedNaoEnt?'<th>Não Entregues</th>':''}
         ${showComputed?'<th>EDR%</th>':''}
         <th>Faltou</th>
+        <th>Desativado</th>
         <th></th>
       </tr></thead><tbody></tbody>`;
     const tbody = table.querySelector('tbody');
@@ -1095,7 +1128,12 @@ function renderRegisto(){
       if (isAbsent) tr.style.opacity = '0.55';
       const evals = formVals.entities[ent] || {};
       const meta = (op.repeating.entityMeta||{})[ent] || {};
-      let tds = `<td class="ent-name">${ent}${isHistorical?' <span class="de-badge inactive" style="margin-left:4px;">antigo</span>':' <button class="de-rename-btn" data-rename-entity="'+ent+'" title="Renomear">✎</button>'}</td>`;
+      const isDeactivatable = !isHistorical; // ainda está na lista de op.repeating.entities
+      const isDeactivatedToday = isDeactivatable && !!(meta.inactiveFrom && registoSel.date >= meta.inactiveFrom);
+      const badge = isHistorical
+        ? (meta.inactiveFrom ? ` <span class="de-badge inactive" style="margin-left:4px;">desativado desde ${meta.inactiveFrom.split('-').reverse().join('/')}</span>` : ' <span class="de-badge inactive" style="margin-left:4px;">antigo</span>')
+        : '';
+      let tds = `<td class="ent-name">${ent}${badge}${isHistorical?'':' <button class="de-rename-btn" data-rename-entity="'+ent+'" title="Renomear">✎</button>'}</td>`;
       if (hasLojas) tds += `<td class="ent-loja">${meta.loja||'—'} ${isHistorical?'':'<button class="de-rename-btn" data-rename-loja="'+ent+'" title="Editar loja">✎</button>'}</td>`;
       op.repeating.fields.forEach(f=>{
         tds += `<td><input type="number" min="0" step="1" data-entity="${ent}" data-entity-key="${f.key}" value="${evals[f.key] ?? ''}" placeholder="0" ${isAbsent?'disabled':''} /></td>`;
@@ -1107,6 +1145,7 @@ function renderRegisto(){
         tds += `<td class="computed-val" data-computed-for="${ent}">—</td>`;
       }
       tds += `<td style="text-align:center;"><input type="checkbox" data-absent-entity="${ent}" ${isAbsent?'checked':''} title="Marcar que ${ent} faltou hoje" /></td>`;
+      tds += `<td style="text-align:center;">${isDeactivatable ? `<input type="checkbox" data-deactivate-entity="${ent}" ${isDeactivatedToday?'checked':''} title="Marcar que ${ent} saiu da operação a partir de ${registoSel.date.split('-').reverse().join('/')} — deixa de aparecer nos dias/meses seguintes, mas os dados anteriores mantêm-se" />` : '—'}</td>`;
       tds += `<td><button class="de-btn danger" data-quick-remove-entity="${ent}" title="Remover ${ent} da lista ativa (dados históricos mantidos)">✕</button> <button class="de-btn danger" data-wipe-entity-reg="${ent}" title="Apagar PERMANENTEMENTE os dados registados desta entidade">🗑</button></td>`;
       tr.innerHTML = tds;
       tbody.appendChild(tr);
@@ -1152,6 +1191,34 @@ function renderRegisto(){
       toast('Voltou para registo de número único em '+op.name);
       render();
     };
+    card.querySelectorAll('[data-deactivate-entity]').forEach(cb=>{
+      cb.onchange = async ()=>{
+        const name = cb.dataset.deactivateEntity;
+        const dataFmt = registoSel.date.split('-').reverse().join('/');
+        if (cb.checked){
+          if (!confirm(`Marcar "${name}" como desativado (saiu da operação) a partir de ${dataFmt}?\n\nA partir desta data deixa de aparecer no Registo em dias/meses seguintes. Os dados de dias/meses anteriores mantêm-se e continuam a contar nas Análises.`)){
+            cb.checked = false;
+            return;
+          }
+          if (!op.repeating.entityMeta) op.repeating.entityMeta = {};
+          op.repeating.entityMeta[name] = op.repeating.entityMeta[name] || {};
+          op.repeating.entityMeta[name].inactiveFrom = registoSel.date;
+          await saveOperations(STATE.operations);
+          await logEdit('Desativou '+op.repeating.entityLabel.toLowerCase(), op.name + ' — ' + name + ' — a partir de ' + registoSel.date);
+          toast(`${name} marcado como desativado a partir de ${dataFmt}`);
+        } else {
+          if (!confirm(`Reativar "${name}" em ${op.name}? Volta a aparecer no Registo a partir de hoje.`)){
+            cb.checked = true;
+            return;
+          }
+          if (op.repeating.entityMeta && op.repeating.entityMeta[name]) delete op.repeating.entityMeta[name].inactiveFrom;
+          await saveOperations(STATE.operations);
+          await logEdit('Reativou '+op.repeating.entityLabel.toLowerCase(), op.name + ' — ' + name);
+          toast(`${name} reativado`);
+        }
+        render();
+      };
+    });
     card.querySelectorAll('[data-quick-remove-entity]').forEach(btn=>{
       btn.onclick = async ()=>{
         const name = btn.dataset.quickRemoveEntity;
@@ -1259,11 +1326,89 @@ function renderRegisto(){
 
   const saveRow = document.createElement('div');
   saveRow.style.cssText = 'margin-top:22px; position:sticky; bottom:0; padding:14px 0 4px 0; background:linear-gradient(180deg, transparent, var(--navy) 30%);';
-  saveRow.innerHTML = `<button class="de-btn" id="reg-save" style="width:100%; padding:14px; font-size:14.5px; letter-spacing:0.02em;">✓ Guardar registo</button>`;
+  saveRow.innerHTML = `
+    <button class="de-btn" id="reg-save" style="width:100%; padding:14px; font-size:14.5px; letter-spacing:0.02em;">✓ Guardar registo</button>
+    <div id="reg-autosave-status" style="text-align:center; font-size:11.5px; margin-top:7px; color:var(--text-faint); font-family:var(--font-mono);">${registoDrafts[draftKey()] ? '● Alterações por guardar…' : ''}</div>
+  `;
   wrap.appendChild(saveRow);
 
   body.innerHTML = '';
   body.appendChild(wrap);
+
+  function setAutosaveStatus(text, color){
+    const el = document.getElementById('reg-autosave-status');
+    if (el){ el.textContent = text || ''; el.style.color = color || 'var(--text-faint)'; }
+  }
+
+  // Constrói o registo do dia a partir do estado atual do formulário —
+  // usado tanto pelo botão "Guardar registo" como pelo auto-save.
+  function buildRecordFromForm(){
+    const record = { fixed:{}, entities:{}, motorista: '', absences: {} };
+    wrap.querySelectorAll('[data-fixed-key]').forEach(inp=>{
+      if (inp.value !== '') record.fixed[inp.dataset.fixedKey] = Number(inp.value);
+    });
+    if (op.repeating){
+      wrap.querySelectorAll('[data-absent-entity]:checked').forEach(cb=>{ record.absences[cb.dataset.absentEntity] = true; });
+      const activeForDate = op.repeating.entities.filter(ent=>isEntityActiveForDate(op, ent, registoSel.date));
+      const histOnly = Object.keys(formVals.entities).filter(e=>!activeForDate.includes(e));
+      [...activeForDate, ...histOnly].forEach(ent=>{ record.entities[ent] = {}; });
+      wrap.querySelectorAll('[data-entity]').forEach(inp=>{
+        if (inp.value !== '' && record.entities[inp.dataset.entity]) record.entities[inp.dataset.entity][inp.dataset.entityKey] = Number(inp.value);
+      });
+      derivedFixed.forEach(f=>{
+        let total = 0, hasData = false;
+        op.repeating.fields.forEach(rf=>{
+          if (rf.role===f.role){
+            Object.values(record.entities).forEach(ev=>{
+              if (ev[rf.key] !== undefined){ total += Number(ev[rf.key]) || 0; hasData = true; }
+            });
+          }
+        });
+        record.fixed[f.key] = hasData ? total : (Number(formVals.fixed[f.key]) || 0);
+      });
+    }
+    if (op.driverField && op.driverField.enabled){
+      const sel = document.getElementById('reg-motorista');
+      record.motorista = sel ? sel.value : '';
+    }
+    return record;
+  }
+
+  // Guarda o registo no Firebase. silent=true é usado pelo auto-save
+  // (não mostra toast nem redesenha o ecrã, para não interromper quem
+  // está a escrever); silent=false é o botão "Guardar registo" normal.
+  async function persistRegisto(opts){
+    const silent = !!(opts && opts.silent);
+    const record = buildRecordFromForm();
+    const recs = STATE.recordsCache[op.id] || (STATE.recordsCache[op.id] = {});
+    recs[registoSel.date] = record;
+    const ok = await saveRecords(op.id, recs);
+    if (!ok){
+      if (silent) setAutosaveStatus('⚠️ Falha no auto-save — tenta guardar manualmente', 'var(--red)');
+      return false;
+    }
+    delete registoDrafts[draftKey()];
+    const savedEntregues = dayEntregues(op, record);
+    const savedTotal = dayTotal(op, record);
+    await logEdit(silent ? 'Registo guardado automaticamente' : 'Registo guardado', op.name + ' — ' + registoSel.date + ' — Entregues: ' + fmt(savedEntregues) + ' · Total: ' + fmt(savedTotal));
+    lastSavedVerify = { opId: op.id, date: registoSel.date };
+    if (silent){
+      const now = new Date();
+      setAutosaveStatus('✓ Guardado automaticamente às ' + String(now.getHours()).padStart(2,'0') + ':' + String(now.getMinutes()).padStart(2,'0'), 'var(--green)');
+    } else {
+      toast(`Guardado: ${op.name} — ${registoSel.date} — Entregues: ${fmt(savedEntregues)} · Total: ${fmt(savedTotal)}`);
+      render();
+    }
+    return true;
+  }
+
+  // Agenda um auto-save ~1.8s depois da última alteração (debounce), para
+  // não fazer um pedido ao Firebase a cada tecla.
+  function scheduleAutosave(){
+    setAutosaveStatus('● Alterações por guardar…', 'var(--text-faint)');
+    if (autosaveTimer) clearTimeout(autosaveTimer);
+    autosaveTimer = setTimeout(()=>{ persistRegisto({ silent: true }); }, 1800);
+  }
 
   function captureDraft(){
     const d = { fixed:{}, entities:{}, motorista:'', absences:{} };
@@ -1278,7 +1423,11 @@ function renderRegisto(){
     const motoristaSel = document.getElementById('reg-motorista');
     if (motoristaSel) d.motorista = motoristaSel.value;
     registoDrafts[draftKey()] = d;
+    scheduleAutosave();
   }
+  // Se já havia um rascunho por guardar deste dia/operação (ex: a pessoa
+  // mudou de aba e voltou), volta a agendar o auto-save.
+  if (registoDrafts[draftKey()]) scheduleAutosave();
   wrap.querySelectorAll('[data-absent-entity]').forEach(cb=>{
     cb.onchange = ()=>{
       const ent = cb.dataset.absentEntity;
@@ -1329,46 +1478,11 @@ function renderRegisto(){
   }
 
   document.getElementById('reg-save').onclick = async ()=>{
-    const record = { fixed:{}, entities:{}, motorista: '', absences: {} };
-    wrap.querySelectorAll('[data-fixed-key]').forEach(inp=>{
-      if (inp.value !== '') record.fixed[inp.dataset.fixedKey] = Number(inp.value);
-    });
-    if (op.repeating){
-      wrap.querySelectorAll('[data-absent-entity]:checked').forEach(cb=>{ record.absences[cb.dataset.absentEntity] = true; });
-      const histOnly = Object.keys(formVals.entities).filter(e=>!op.repeating.entities.includes(e));
-      [...op.repeating.entities, ...histOnly].forEach(ent=>{ record.entities[ent] = {}; });
-      wrap.querySelectorAll('[data-entity]').forEach(inp=>{
-        if (inp.value !== '') record.entities[inp.dataset.entity][inp.dataset.entityKey] = Number(inp.value);
-      });
-      derivedFixed.forEach(f=>{
-        let total = 0, hasData = false;
-        op.repeating.fields.forEach(rf=>{
-          if (rf.role===f.role){
-            Object.values(record.entities).forEach(ev=>{
-              if (ev[rf.key] !== undefined){ total += Number(ev[rf.key]) || 0; hasData = true; }
-            });
-          }
-        });
-        record.fixed[f.key] = hasData ? total : (Number(formVals.fixed[f.key]) || 0);
-      });
-    }
-    if (op.driverField && op.driverField.enabled){
-      const sel = document.getElementById('reg-motorista');
-      record.motorista = sel ? sel.value : '';
-    }
-    const recs = STATE.recordsCache[op.id] || (STATE.recordsCache[op.id] = {});
-    recs[registoSel.date] = record;
     const btn = document.getElementById('reg-save');
+    if (autosaveTimer) { clearTimeout(autosaveTimer); autosaveTimer = null; }
     btn.textContent = 'A guardar…'; btn.disabled = true;
-    await saveRecords(op.id, recs);
-    delete registoDrafts[draftKey()];
+    await persistRegisto({ silent: false });
     btn.textContent = 'Guardar registo'; btn.disabled = false;
-    const savedEntregues = dayEntregues(op, record);
-    const savedTotal = dayTotal(op, record);
-    await logEdit('Registo guardado', op.name + ' — ' + registoSel.date + ' — Entregues: ' + fmt(savedEntregues) + ' · Total: ' + fmt(savedTotal));
-    toast(`Guardado: ${op.name} — ${registoSel.date} — Entregues: ${fmt(savedEntregues)} · Total: ${fmt(savedTotal)}`);
-    lastSavedVerify = { opId: op.id, date: registoSel.date };
-    render();
   };
 }
 
@@ -1414,6 +1528,7 @@ function computeMissingDays(op){
       const absences = (rec && rec.absences) || {};
       const entities = (rec && rec.entities) || {};
       const incomplete = op.repeating.entities.some(ent=>{
+        if (!isEntityActiveForDate(op, ent, d)) return false;
         if (absences[ent]) return false;
         const ev = entities[ent];
         return !ev || !Object.keys(ev).length;
