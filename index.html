@@ -452,7 +452,7 @@ function defaultOperations(){
     { id:'dhl_coimbra', name:'DHL COIMBRA', sector:'Parcel', active:true, fields:[R('entregas','Entregas','total'), R('entregues','Entregues','entregues'), R('recolhas','Recolhas'), R('incidencias','Incidências'), R('nao_visitado','N. Visitado')], repeating:null, driverField:{enabled:true, list:[]} },
     { id:'ups', name:'UPS', sector:'Parcel', active:true, fields:[R('entregas','Entregas','total'), R('entregues','Entregues','entregues'), R('recolhas','Recolhas'), R('incidencias','Incidências'), R('nao_visitado','N. Visitado')], repeating:null, driverField:{enabled:true, list:[]} },
     { id:'dominos', name:"DOMINO'S PIZZA", sector:'Restauração', active:true, fields:[], driverField:null, repeating:{ entityLabel:'Motorista', entities:['Misael','Marcos C.','Everton Santos','Elvine','Silas Fernandes','Matheus Martins','Diogo Cabo','Roberto','Samuel','Pedro','David Silva','Patric','Pedro Fernandes','Isaac','Henrique Crosio','Joseny Luis','Paulo / Ruben','Antonio Martins'], entityMeta:{'Misael':{loja:'Loures'},'Marcos C.':{loja:'Odivelas'},'Everton Santos':{loja:'Areeiro'},'Elvine':{loja:'Areeiro'},'Silas Fernandes':{loja:'Campo Ourique'},'Matheus Martins':{loja:'Expo Sul'},'Diogo Cabo':{loja:'Algés'},'Roberto':{loja:'Carcavelos'},'Samuel':{loja:'Oeiras'},'David Silva':{loja:'Expo Norte'},'Patric':{loja:'Avenidas'},'Pedro Fernandes':{loja:'Sta Iria Azóia'},'Isaac':{loja:'Montijo'},'Henrique Crosio':{loja:'Espinho'},'Joseny Luis':{loja:'Amial'}}, fields:[R('entregas','Entregas','entregues')] } },
-    { id:'gls', name:'GLS', sector:'Parcel', active:true, fields:[], driverField:null, repeating:{ entityLabel:'Motorista', entities:['Douglas Barcelos','Gabriel'], entityMeta:{}, fields:[R('parcel_shop_inicio','Parcel Shop Início'), R('entregas','Entregas','total'), R('entregues','Entregues','entregues'), R('recolhas','Recolhas'), R('incidencia','Incidência'), R('nao_visitado','Não Visitado'), R('parcel_shop_fim','Parcel Shop Fim')] } },
+    { id:'gls', name:'GLS', sector:'Parcel', active:true, fields:[], driverField:null, repeating:{ entityLabel:'Motorista', entities:['Douglas Barcelos','Gabriel'], entityMeta:{}, fields:[R('parcel_shop_inicio','Parcel Shop Início'), R('entregas','Entregas planeadas','total'), R('entregues','Entregues','entregues'), R('recolhas','Recolhas'), R('incidencia','Incidência'), R('nao_visitado','Não Visitado'), R('parcel_shop_fim','Parcel Shop Fim')] } },
     { id:'hugo_boss', name:'HUGO BOSS', sector:'Vestuário', active:true, fields:[R('entregues','Entregues Total','entregues')], driverField:null, repeating:{ entityLabel:'Região', entities:['Lisboa','Porto'], entityMeta:{}, fields:[R('stops','Stops','total')] } },
     { id:'justsushi', name:'JUSTSUSHI', sector:'Restauração', active:true, fields:[], driverField:null, repeating:{ entityLabel:'Motorista', entities:['Elder Fidelis','Luis','Fernando'], entityMeta:{'Elder Fidelis':{loja:'Évora'},'Luis':{loja:'Coimbra'},'Fernando':{loja:'Coimbra'}}, fields:[R('entregas','Entregas','entregues')] } },
     { id:'nacex_massama', name:'NACEX MASSAMÁ', sector:'Parcel', active:true, fields:[], driverField:null, repeating:{ entityLabel:'Motorista', entities:['Mauricio / Andrey','Emanuel','Miguel','M30 - Felipe','M21 - Felipe Santos Alvarenga'], entityMeta:{}, fields:[R('premium','Premium'), R('encomendas','Encomendas','total'), R('entregues','Entregues','entregues'), R('incidencias','Incidências'), R('nao_visitados','N. Visitados')] } },
@@ -780,13 +780,18 @@ function isEntityActiveForDate(op, ent, dateStr){
 // RENDER: TABS
 // ============================================================
 function renderTabs(){
-  const tabs = [['registo','Registo'],['analises','Análises'],['historico','Histórico'],['config','Configurações']];
+  const tabs = [['registo','Registo'],['analises','Análises'],['alertas','Alertas'],['historico','Histórico'],['config','Configurações']];
   const el = document.getElementById('de-tabs');
   el.innerHTML = '';
   tabs.forEach(([id,label])=>{
     const btn = document.createElement('button');
     btn.className = 'de-tab' + (STATE.tab===id ? ' active' : '');
-    btn.textContent = label;
+    if (id==='alertas'){
+      const totalMissing = STATE.operations.filter(o=>o.active).reduce((s,o)=>s+computeAllMissingDays(o).length,0);
+      btn.innerHTML = label + (totalMissing>0 ? ` <span style="background:var(--red);color:#fff;border-radius:10px;padding:1px 6px;font-size:11px;margin-left:4px;">${totalMissing}</span>` : ' <span style="color:var(--green);">✓</span>');
+    } else {
+      btn.textContent = label;
+    }
     btn.onclick = ()=>{ STATE.tab = id; render(); };
     el.appendChild(btn);
   });
@@ -796,6 +801,8 @@ function renderTabs(){
 // RENDER: REGISTO TAB
 // ============================================================
 let registoSel = { opId: null, date: todayISO() };
+let registoMonthlyOpen = false;
+let inactiveListOpen = false;
 let registoDrafts = {};
 let lastSavedVerify = null;
 function draftKey(){ return registoSel.opId+'|'+registoSel.date; }
@@ -955,6 +962,100 @@ function renderRegisto(){
       toast('Registo apagado permanentemente');
       render();
     };
+  }
+
+  // ------------------------------------------------------------
+  // RESUMO MENSAL (sem detalhar por dia) — disponível em qualquer operação,
+  // sem alterar o fluxo diário já existente. Grava um registo especial no
+  // 1º dia do mês, marcado com monthlySummary:true, usando os campos com
+  // papel (role) total/entregues/não_entregues da própria operação.
+  // ------------------------------------------------------------
+  function opRoleFields(o){
+    const src = o.repeating ? o.repeating.fields : (o.fields||[]);
+    return src.filter(f=>f.role==='total' || f.role==='entregues' || f.role==='nao_entregues');
+  }
+  const roleFieldsForSummary = opRoleFields(op);
+  if (roleFieldsForSummary.length){
+    const sumCard = document.createElement('div');
+    sumCard.className = 'de-card';
+    const curYear = Number(todayISO().slice(0,4));
+    const monthKeyOf = (y,m)=> y+'-'+String(m).padStart(2,'0');
+    if (!registoSel.summaryYear) registoSel.summaryYear = curYear;
+    if (!registoSel.summaryMonth) registoSel.summaryMonth = Number(todayISO().slice(5,7));
+    const smk = monthKeyOf(registoSel.summaryYear, registoSel.summaryMonth);
+    const smDateKey = smk+'-01';
+    const smRec = records[smDateKey] && records[smDateKey].monthlySummary ? records[smDateKey] : null;
+    const smVals = op.repeating
+      ? (smRec ? (smRec.entities['Total do mês (sem detalhe diário)']||{}) : {})
+      : (smRec ? (smRec.fixed||{}) : {});
+    sumCard.innerHTML = `
+      <div class="de-flex-between" style="margin-bottom:${registoMonthlyOpen?'12px':'0'};">
+        <h3 style="margin-bottom:0;">🗓️ Total do mês (sem detalhar por dia)</h3>
+        <button class="de-btn ghost small" id="reg-toggle-monthly">${registoMonthlyOpen?'▲ Ocultar':'▼ Preencher / ver total do mês'}</button>
+      </div>
+      ${registoMonthlyOpen ? `
+      <div style="font-size:12px;color:var(--text-faint);margin:4px 0 12px;">Usa isto para clientes cujo número só sai fechado no fim do mês — não precisas de preencher dia a dia. ${smRec?'<strong style=\"color:var(--green);\">Já existe um total guardado para este mês.</strong>':''}</div>
+      <div class="de-row">
+        <div class="de-field"><label>Mês</label><select id="reg-summary-month">${[1,2,3,4,5,6,7,8,9,10,11,12].map(m=>`<option value="${m}" ${m===registoSel.summaryMonth?'selected':''}>${monthName(m)}</option>`).join('')}</select></div>
+        <div class="de-field"><label>Ano</label><select id="reg-summary-year">${[curYear-1,curYear,curYear+1].map(y=>`<option value="${y}" ${y===registoSel.summaryYear?'selected':''}>${y}</option>`).join('')}</select></div>
+      </div>
+      <div class="de-grid-fields">
+        ${roleFieldsForSummary.map(f=>`<div class="de-field"><label>${f.label}</label><input type="number" min="0" step="1" data-summary-key="${f.key}" value="${smVals[f.key] ?? ''}" placeholder="0" /></div>`).join('')}
+      </div>
+      <div style="margin:10px 0;font-family:var(--font-mono);font-size:15px;" id="reg-summary-edr"></div>
+      <div style="display:flex;gap:8px;">
+        <button class="de-btn" id="reg-summary-save">💾 Guardar total do mês</button>
+        ${smRec ? `<button class="de-btn danger" id="reg-summary-clear">🗑 Remover total do mês</button>` : ''}
+      </div>
+      ` : ''}
+    `;
+    wrap.appendChild(sumCard);
+    if (registoMonthlyOpen){
+      const updateSummaryEdr = ()=>{
+        const vals = {};
+        sumCard.querySelectorAll('[data-summary-key]').forEach(inp=>{ vals[inp.dataset.summaryKey] = Number(inp.value)||0; });
+        let tot = 0; roleFieldsForSummary.forEach(f=>{ if (f.role==='total') tot += vals[f.key]||0; });
+        let ent = 0; roleFieldsForSummary.forEach(f=>{ if (f.role==='entregues') ent += vals[f.key]||0; });
+        if (!tot){ let nao=0; roleFieldsForSummary.forEach(f=>{ if (f.role==='nao_entregues') nao += vals[f.key]||0; }); if (ent||nao) tot = ent+nao; }
+        const edrDiv = sumCard.querySelector('#reg-summary-edr');
+        edrDiv.innerHTML = tot>0 ? `EDR do mês: ${edrHtml(ent/tot)}` : '';
+      };
+      sumCard.querySelectorAll('[data-summary-key]').forEach(inp=>inp.addEventListener('input', updateSummaryEdr));
+      updateSummaryEdr();
+      sumCard.querySelector('#reg-summary-month').onchange = (e)=>{ registoSel.summaryMonth = Number(e.target.value); render(); };
+      sumCard.querySelector('#reg-summary-year').onchange = (e)=>{ registoSel.summaryYear = Number(e.target.value); render(); };
+      sumCard.querySelector('#reg-summary-save').onclick = async ()=>{
+        const vals = {};
+        sumCard.querySelectorAll('[data-summary-key]').forEach(inp=>{ const v = Number(inp.value); if (inp.value!=='' && !isNaN(v)) vals[inp.dataset.summaryKey] = v; });
+        if (!Object.keys(vals).length){ toast('Preenche pelo menos um valor'); return; }
+        const recs = STATE.recordsCache[op.id] || (STATE.recordsCache[op.id] = {});
+        const otherDailyDates = allDatesForMonth(registoSel.summaryYear, registoSel.summaryMonth).filter(d=>d<=todayISO() && recs[d] && !recs[d].monthlySummary && (Object.keys(recs[d].fixed||{}).length || Object.values(recs[d].entities||{}).some(ev=>Object.keys(ev||{}).length)));
+        if (otherDailyDates.length){
+          if (!confirm(`Já existem ${otherDailyDates.length} dia(s) com registo diário em ${monthName(registoSel.summaryMonth)}/${registoSel.summaryYear} para ${op.name}. Guardar o total do mês vai APAGAR esses registos diários (para não contar em duplicado). Continuar?`)) return;
+          otherDailyDates.forEach(d=>delete recs[d]);
+        }
+        recs[smDateKey] = op.repeating
+          ? { fixed:{}, entities:{ 'Total do mês (sem detalhe diário)': vals }, motorista:'', absences:{}, monthlySummary:true, summaryMonth: smk }
+          : { fixed: vals, entities:{}, motorista:'', absences:{}, monthlySummary:true, summaryMonth: smk };
+        await saveRecords(op.id, recs);
+        await logEdit('Guardou total do mês', op.name + ' — ' + monthName(registoSel.summaryMonth) + '/' + registoSel.summaryYear);
+        toast('Total do mês guardado');
+        render();
+      };
+      const clearBtn = sumCard.querySelector('#reg-summary-clear');
+      if (clearBtn){
+        clearBtn.onclick = async ()=>{
+          if (!confirm('Remover o total mensal guardado? Podes voltar a preencher dia a dia depois.')) return;
+          const recs = STATE.recordsCache[op.id] || (STATE.recordsCache[op.id] = {});
+          delete recs[smDateKey];
+          await saveRecords(op.id, recs);
+          await logEdit('Removeu total do mês', op.name + ' — ' + monthName(registoSel.summaryMonth) + '/' + registoSel.summaryYear);
+          toast('Total do mês removido');
+          render();
+        };
+      }
+    }
+    sumCard.querySelector('#reg-toggle-monthly').onclick = ()=>{ registoMonthlyOpen = !registoMonthlyOpen; render(); };
   }
 
   const missingDays = computeMissingDays(op);
@@ -1219,19 +1320,25 @@ function renderRegisto(){
     if (inactiveEntities.length){
       const inactiveCard = document.createElement('div');
       inactiveCard.className = 'de-card';
-      inactiveCard.innerHTML = `<h3>🚫 ${op.repeating.entityLabel}s desativados</h3>`;
-      const list = document.createElement('div');
-      list.style.cssText = 'display:flex;flex-direction:column;gap:8px;';
-      inactiveEntities.forEach(ent=>{
-        const meta = op.repeating.entityMeta[ent];
-        const row = document.createElement('div');
-        row.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 12px;background:var(--navy);border:1px solid var(--border);border-radius:8px;';
-        row.innerHTML = `<span>${ent} <span class="de-badge inactive" style="margin-left:4px;">desativado desde ${meta.inactiveFrom.split('-').reverse().join('/')}</span></span>
-          <button class="de-btn ghost small" data-reactivate-entity="${ent}">↺ Reativar</button>`;
-        list.appendChild(row);
-      });
-      inactiveCard.appendChild(list);
+      inactiveCard.innerHTML = `<div class="de-flex-between" style="margin-bottom:0;">
+        <h3 style="margin-bottom:0;">🚫 ${op.repeating.entityLabel}s desativados (${inactiveEntities.length})</h3>
+        <button class="de-btn ghost small" id="reg-toggle-inactive">${inactiveListOpen?'▲ Minimizar':'▼ Mostrar lista'}</button>
+      </div>`;
+      if (inactiveListOpen){
+        const list = document.createElement('div');
+        list.style.cssText = 'display:flex;flex-direction:column;gap:8px;margin-top:12px;';
+        inactiveEntities.forEach(ent=>{
+          const meta = op.repeating.entityMeta[ent];
+          const row = document.createElement('div');
+          row.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 12px;background:var(--navy);border:1px solid var(--border);border-radius:8px;';
+          row.innerHTML = `<span>${ent} <span class="de-badge inactive" style="margin-left:4px;">desativado desde ${meta.inactiveFrom.split('-').reverse().join('/')}</span></span>
+            <button class="de-btn ghost small" data-reactivate-entity="${ent}">↺ Reativar</button>`;
+          list.appendChild(row);
+        });
+        inactiveCard.appendChild(list);
+      }
       wrap.appendChild(inactiveCard);
+      inactiveCard.querySelector('#reg-toggle-inactive').onclick = ()=>{ inactiveListOpen = !inactiveListOpen; render(); };
       inactiveCard.querySelectorAll('[data-reactivate-entity]').forEach(btn=>{
         btn.onclick = async ()=>{
           const name = btn.dataset.reactivateEntity;
@@ -1596,11 +1703,22 @@ function computeOpRangeStats(op, dates){
   return { entregues, total, diasComRegisto, edr: total>0? entregues/total : null, mediaEntregues: diasComRegisto>0? entregues/diasComRegisto : null };
 }
 
-function computeMissingDays(op){
+function monthHasSummary(op, year, month){
   const records = STATE.recordsCache[op.id] || {};
-  const workDays = op.workDays || [0,1,2,3,4,5,6];
+  const key = year+'-'+String(month).padStart(2,'0');
+  return Object.values(records).some(r=>r && r.monthlySummary && r.summaryMonth===key);
+}
+
+function computeMissingDays(op){
   const today = new Date();
   const year = today.getFullYear(), month = today.getMonth()+1;
+  return computeMissingDaysForMonth(op, year, month);
+}
+
+function computeMissingDaysForMonth(op, year, month){
+  const records = STATE.recordsCache[op.id] || {};
+  const workDays = op.workDays || [0,1,2,3,4,5,6];
+  if (monthHasSummary(op, year, month)) return [];
   const yesterdayISO = (()=>{ const d=new Date(); d.setDate(d.getDate()-1); return d.toISOString().slice(0,10); })();
   const allDays = allDatesForMonth(year, month).filter(d=>d<=yesterdayISO);
   const missing = [];
@@ -1624,6 +1742,27 @@ function computeMissingDays(op){
       if (!hasData) missing.push(d);
     }
   });
+  return missing;
+}
+
+// Varre desde o primeiro registo da operação (ou Jan/2026) até ontem,
+// mês a mês, devolvendo todos os dias em falta — usado na aba Alertas.
+function computeAllMissingDays(op){
+  const records = STATE.recordsCache[op.id] || {};
+  const dates = Object.keys(records);
+  const today = new Date();
+  const todayY = today.getFullYear(), todayM = today.getMonth()+1;
+  let startY = 2026, startM = 1;
+  if (dates.length){
+    const earliest = dates.sort()[0];
+    startY = Number(earliest.slice(0,4)); startM = Number(earliest.slice(5,7));
+  }
+  const missing = [];
+  let y = startY, m = startM;
+  while (y < todayY || (y===todayY && m<=todayM)){
+    computeMissingDaysForMonth(op, y, m).forEach(d=>missing.push(d));
+    m++; if (m>12){ m=1; y++; }
+  }
   return missing;
 }
 
@@ -2331,6 +2470,84 @@ function renderHistorico(){
   };
 }
 
+// ============================================================
+// RENDER: ALERTAS (dados não preenchidos)
+// ============================================================
+let alertasOpFilter = 'all';
+
+function renderAlertas(){
+  const body = document.getElementById('de-body');
+  const wrap = document.createElement('div');
+
+  const intro = document.createElement('div');
+  intro.style.cssText = 'font-size:13px;color:var(--text-faint);margin-bottom:16px;';
+  intro.textContent = 'Mostra todos os dias/meses sem registo completo, desde o início dos dados até ontem. Clica num dia para ir direto preenchê-lo no Registo. Meses cobertos por um "total do mês" não entram aqui.';
+  wrap.appendChild(intro);
+
+  const controls = document.createElement('div');
+  controls.className = 'de-row';
+  const activeOps = STATE.operations.filter(o=>o.active).sort((a,b)=>a.name.localeCompare(b.name));
+  controls.innerHTML = `<div class="de-field"><label>Operação</label><select id="al-op"><option value="all">Todas</option>${activeOps.map(o=>`<option value="${o.id}">${o.name}</option>`).join('')}</select></div>`;
+  wrap.appendChild(controls);
+  controls.querySelector('#al-op').value = alertasOpFilter;
+  controls.querySelector('#al-op').onchange = (e)=>{ alertasOpFilter = e.target.value; render(); };
+
+  const opsToCheck = alertasOpFilter==='all' ? activeOps : activeOps.filter(o=>o.id===alertasOpFilter);
+  const results = opsToCheck.map(op=>({ op, missing: computeAllMissingDays(op) }));
+  const totalMissing = results.reduce((s,r)=>s+r.missing.length,0);
+
+  const kpis = document.createElement('div');
+  kpis.className = 'de-kpis';
+  kpis.innerHTML = `
+    <div class="de-kpi"><div class="label">${totalMissing===0?'✅':'⚠️'} Dias em falta</div><div class="value ${totalMissing===0?'green':'red'}">${totalMissing}</div></div>
+    <div class="de-kpi"><div class="label">🏷 Operações com pendências</div><div class="value">${results.filter(r=>r.missing.length).length} de ${opsToCheck.length}</div></div>
+  `;
+  wrap.appendChild(kpis);
+
+  if (totalMissing===0){
+    const ok = document.createElement('div');
+    ok.className = 'de-empty';
+    ok.innerHTML = `<div class="big">✅</div>Tudo preenchido! Não há dias em falta ${alertasOpFilter==='all'?'em nenhuma operação':'em '+opsToCheck[0].name}.`;
+    wrap.appendChild(ok);
+    body.innerHTML = ''; body.appendChild(wrap);
+    return;
+  }
+
+  results.filter(r=>r.missing.length).forEach(({op, missing})=>{
+    const card = document.createElement('div');
+    card.className = 'de-card';
+    // agrupa por mês para não virar uma parede de botões
+    const byMonth = {};
+    missing.forEach(d=>{ const mk = d.slice(0,7); (byMonth[mk] = byMonth[mk]||[]).push(d); });
+    const monthKeys = Object.keys(byMonth).sort();
+    card.innerHTML = `<h3>${op.name} <span style="color:var(--red);font-weight:400;font-size:13px;">— ${missing.length} dia(s) em falta</span></h3>
+      ${monthKeys.map(mk=>{
+        const [y,m] = mk.split('-');
+        return `<div style="margin-top:10px;">
+          <div style="font-size:12px;color:var(--text-faint);margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em;">${monthName(Number(m))}/${y}</div>
+          <div style="display:flex;flex-wrap:wrap;gap:6px;">
+            ${byMonth[mk].map(d=>`<button class="de-btn ghost small" data-alert-goto="${op.id}|${d}" style="border-color:var(--red);color:var(--red);">${d.split('-').reverse().join('/')}</button>`).join('')}
+          </div>
+        </div>`;
+      }).join('')}
+    `;
+    wrap.appendChild(card);
+  });
+
+  body.innerHTML = '';
+  body.appendChild(wrap);
+
+  wrap.querySelectorAll('[data-alert-goto]').forEach(btn=>{
+    btn.onclick = ()=>{
+      const [opId, date] = btn.dataset.alertGoto.split('|');
+      registoSel.opId = opId;
+      registoSel.date = date;
+      STATE.tab = 'registo';
+      render();
+    };
+  });
+}
+
 function renderConfig(){
   const body = document.getElementById('de-body');
   const wrap = document.createElement('div');
@@ -2843,6 +3060,7 @@ function render(){
   renderTabs();
   if (STATE.tab==='registo') renderRegisto();
   else if (STATE.tab==='analises') renderAnalises();
+  else if (STATE.tab==='alertas') renderAlertas();
   else if (STATE.tab==='historico') renderHistorico();
   else if (STATE.tab==='config') renderConfig();
 }
@@ -2884,6 +3102,12 @@ function migrateOperations(ops){
           op.repeating.fields.push({...defField});
         }
       });
+    }
+    // GLS: sincroniza o rótulo do campo "Entregas" -> "Entregas planeadas"
+    // (o EDR já usa só este campo (total) + Entregues, não precisa de mais nada).
+    if (op.id === 'gls' && op.repeating){
+      const f = op.repeating.fields.find(x=>x.key==='entregas');
+      if (f) f.label = 'Entregas planeadas';
     }
     // Correção DHL Express: remove o campo legado "Entregas" (que ficava
     // duplicado com "Stops Planeados" e inflacionava o total usado no EDR).
