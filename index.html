@@ -524,7 +524,7 @@ function defaultOperations(){
     { id:'dhl_parcel_lisboa', name:'DHL PARCEL LISBOA', sector:'Parcel', active:true, fields:[], driverField:null, repeating:{ entityLabel:'Motorista', entities:['Afonso','Leandro Lopes'], entityMeta:{}, fields:[R('stops','Stops','total'), R('entregues','Entregues','entregues'), R('recolhas','Recolhas'), R('devolvidos','Devolvidos')] } },
     { id:'dhl_express', name:'DHL EXPRESS', sector:'Parcel', active:true, fields:[], driverField:null, repeating:{ entityLabel:'Motorista', entities:['Lincol Santos','Leticia Gonçalves','André Silva','Marlus Falcão','Igor Mendonça','Wellington Afonso'], entityMeta:{}, fields:[R('stops','Stops Planeados','total'), R('entregues','Entregues','entregues'), R('recolhas','Recolhas')] } },
     { id:'dpd_algarve', name:'DPD ALGARVE', sector:'Parcel', active:true, fields:[], driverField:null, repeating:{ entityLabel:'Motorista', entities:['Kaua Junior — Praia da Luz','Nilto Gomes — Praia da Luz','Otelindo — Sagres'], entityMeta:{}, fields:[R('objectos','Objectos'), R('recolhas','Recolhas')] } },
-    { id:'dhl_vilareal', name:'DHL VILA REAL', sector:'Parcel', active:true, fields:[], driverField:null, repeating:{ entityLabel:'Motorista', entities:['Vitor','Lito','Rodrigo'], entityMeta:{}, fields:[R('objectos','Objectos'), R('entregues','Entregues','entregues')] } },
+    { id:'dhl_vilareal', name:'DHL VILA REAL', sector:'Parcel', active:true, fields:[], driverField:null, repeating:{ entityLabel:'Motorista', entities:['Vitor','Lito','Rodrigo'], entityMeta:{}, fields:[R('stops','Stops Planeados','total'), R('entregues','Entregues','entregues')] } },
   ];
 }
 // attach default work-days (0=Domingo .. 6=Sábado) — Parcel doesn't run Sundays by default,
@@ -632,6 +632,29 @@ async function logEdit(action, details){
 // ---------- Escutas em tempo real ----------
 const _recordsListeners = {};
 
+async function migrateDhlVilarealRecords(){
+  const op = STATE.operations.find(o=>o.id==='dhl_vilareal');
+  if (!op || !op.repeating) return;
+  const records = STATE.recordsCache['dhl_vilareal'] || {};
+  let changed = false;
+  Object.values(records).forEach(rec=>{
+    if (!rec || !rec.entities) return;
+    Object.values(rec.entities).forEach(ev=>{
+      if (ev && ev.objectos !== undefined){
+        if (ev.stops === undefined || ev.stops === null || ev.stops === ''){
+          ev.stops = ev.objectos;
+        }
+        delete ev.objectos;
+        changed = true;
+      }
+    });
+  });
+  if (changed){
+    await saveRecords('dhl_vilareal', records);
+    await logEdit('Migração automática', 'DHL Vila Real — campo "Objectos" convertido para "Stops Planeados" (dados preservados)');
+  }
+}
+
 async function migrateGlsRecords(){
   const op = STATE.operations.find(o=>o.id==='gls');
   if (!op || !op.repeating) return;
@@ -686,6 +709,7 @@ function ensureAllOpsHaveRecordsListener(){
       setConnStatus(true);
       if (op.id==='dhl_express') migrateDhlExpressRecords();
       if (op.id==='gls') migrateGlsRecords();
+      if (op.id==='dhl_vilareal') migrateDhlVilarealRecords();
       if (!isEditingNow()) render();
     }, err=>{
       console.error('listener de registos falhou', op.id, err);
@@ -3427,6 +3451,17 @@ function migrateOperations(ops){
         let ib = desiredOrder.indexOf(b.key); if (ib===-1) ib = 999;
         return ia-ib;
       });
+    }
+    // DHL Vila Real: "Objectos" não tinha papel nenhum, então o EDR caía
+    // sempre em 100% (não havia campo "total" para dividir). Renomeia para
+    // "Stops Planeados" com papel total — EDR passa a ser Entregues/Stops.
+    if (op.id === 'dhl_vilareal' && op.repeating){
+      op.repeating.fields = op.repeating.fields.filter(f=>f.key!=='objectos');
+      const totalFieldsVR = op.repeating.fields.filter(f=>f.role==='total');
+      if (totalFieldsVR.length > 1) totalFieldsVR.slice(1).forEach(f=>{ f.role=null; });
+      if (!op.repeating.fields.some(f=>f.key==='stops')){
+        op.repeating.fields.unshift({ key:'stops', label:'Stops Planeados', role:'total' });
+      }
     }
     // Correção DHL Express: remove o campo legado "Entregas" (que ficava
     // duplicado com "Stops Planeados" e inflacionava o total usado no EDR).
