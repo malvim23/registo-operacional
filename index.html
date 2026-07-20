@@ -377,7 +377,15 @@ const valueLabelsPlugin = {
   id: 'deValueLabels',
   afterDatasetsDraw(chart){
     const {ctx} = chart;
-    chart.data.datasets.forEach((dataset, dsIndex)=>{
+    // Desenha primeiro todas as labels das barras, depois as da linha (EDR%)
+    // por cima — assim o EDR nunca fica escondido atrás do número da barra.
+    const order = chart.data.datasets.map((d,i)=>i).sort((a,b)=>{
+      const ta = chart.getDatasetMeta(a).type === 'line' ? 1 : 0;
+      const tb = chart.getDatasetMeta(b).type === 'line' ? 1 : 0;
+      return ta-tb;
+    });
+    order.forEach(dsIndex=>{
+      const dataset = chart.data.datasets[dsIndex];
       const meta = chart.getDatasetMeta(dsIndex);
       if (meta.hidden || dataset.hideLabels) return;
       const isLine = meta.type === 'line';
@@ -390,11 +398,21 @@ const valueLabelsPlugin = {
         ctx.save();
         ctx.font = '700 10px Inter, sans-serif';
         ctx.textAlign = 'center';
-        ctx.fillStyle = isLine ? (dataset.borderColor || chartGreen()) : chartLabelText();
+        const textColor = isLine ? (dataset.borderColor || chartGreen()) : chartLabelText();
         const pos = element.tooltipPosition ? element.tooltipPosition() : element.getCenterPoint();
-        ctx.textBaseline = isLine ? 'bottom' : 'bottom';
-        const offset = isLine ? 8 : 6;
-        ctx.fillText(label, pos.x, pos.y - offset);
+        ctx.textBaseline = 'bottom';
+        const offset = isLine ? 14 : 6;
+        const ty = pos.y - offset;
+        // Fundo (chip) atrás do texto, para não se perder sobre barras/linhas
+        const textW = ctx.measureText(label).width;
+        const padX = 4, padY = 2, boxH = 13;
+        ctx.fillStyle = currentTheme==='light' ? 'rgba(255,255,255,0.88)' : 'rgba(10,18,36,0.82)';
+        ctx.beginPath();
+        if (ctx.roundRect){ ctx.roundRect(pos.x-textW/2-padX, ty-boxH+padY, textW+padX*2, boxH, 4); }
+        else { ctx.rect(pos.x-textW/2-padX, ty-boxH+padY, textW+padX*2, boxH); }
+        ctx.fill();
+        ctx.fillStyle = textColor;
+        ctx.fillText(label, pos.x, ty);
         ctx.restore();
       });
     });
@@ -754,6 +772,18 @@ function dateRangeArray(days){
 function daysInMonth(year, month){
   return new Date(year, month, 0).getDate();
 }
+// Projeta o total de "entregues" do mês, se ele ainda estiver em curso —
+// usado para comparar de forma justa um mês parcial (ex.: dia 15) com um
+// mês anterior já fechado, em vez de comparar "15 dias" com "30 dias".
+function projectMonthEntregues(stats, year, month){
+  const totalDays = daysInMonth(year, month);
+  const t = todayISO();
+  const isCurrent = year===Number(t.slice(0,4)) && month===Number(t.slice(5,7));
+  if (isCurrent && stats.diasComRegisto>0 && stats.diasComRegisto<totalDays){
+    return { value: stats.entregues/stats.diasComRegisto*totalDays, isProjected:true, dias:stats.diasComRegisto, totalDays };
+  }
+  return { value: stats.entregues, isProjected:false, dias:stats.diasComRegisto, totalDays };
+}
 function allDatesForMonth(year, month){
   const n = daysInMonth(year, month);
   const arr = [];
@@ -792,15 +822,35 @@ function groupDatesBy(dates, groupBy){
   return Object.values(map).sort((a,b)=>a.key.localeCompare(b.key));
 }
 
-// Um motorista/entidade "desativado a partir de" uma data continua a
-// aparecer (e a contar) em todos os dias/meses ANTERIORES a essa data, mas
-// deixa de aparecer no formulário de Registo a partir dela (inclusive o
-// próprio dia da desativação ainda o mostra, para fechar esse dia).
+// Um motorista/entidade tem uma "janela" de atividade por data:
+// - meta.createdFrom: se definido, não existe (nem para alertas) antes dessa data.
+// - meta.inactivePeriods: lista de { from, to } — "to" null/undefined = ainda
+//   inativo; quando é reativado, "to" passa a ser a data da reativação, e o
+//   período fica fechado (preservado no histórico, não é apagado). Isto evita
+//   que dias em que a pessoa esteve legitimamente desativada voltem a disparar
+//   alerta de dados em falta depois de uma reativação meses depois.
+// (mantém compatibilidade com o formato antigo meta.inactiveFrom de versões anteriores)
 function isEntityActiveForDate(op, ent, dateStr){
   if (!op.repeating) return true;
   const meta = (op.repeating.entityMeta||{})[ent] || {};
-  if (!meta.inactiveFrom) return true;
-  return dateStr <= meta.inactiveFrom;
+  if (meta.createdFrom && dateStr < meta.createdFrom) return false;
+  const periods = meta.inactivePeriods || (meta.inactiveFrom ? [{ from: addDays(meta.inactiveFrom,1), to: null }] : []);
+  for (let i=0; i<periods.length; i++){
+    const p = periods[i];
+    if (dateStr >= p.from && (!p.to || dateStr < p.to)) return false;
+  }
+  return true;
+}
+
+function isEntityCurrentlyInactive(op, ent){
+  const meta = (op.repeating.entityMeta||{})[ent] || {};
+  const periods = meta.inactivePeriods || (meta.inactiveFrom ? [{ from: addDays(meta.inactiveFrom,1), to: null }] : []);
+  return periods.some(p=>!p.to);
+}
+function currentInactivePeriod(op, ent){
+  const meta = (op.repeating.entityMeta||{})[ent] || {};
+  const periods = meta.inactivePeriods || (meta.inactiveFrom ? [{ from: addDays(meta.inactiveFrom,1), to: null }] : []);
+  return periods.find(p=>!p.to) || null;
 }
 
 // ============================================================
@@ -1386,9 +1436,10 @@ function renderRegisto(){
       const evals = formVals.entities[ent] || {};
       const meta = (op.repeating.entityMeta||{})[ent] || {};
       const isDeactivatable = !isHistorical; // ainda está na lista de op.repeating.entities
-      const isDeactivatedToday = isDeactivatable && !!(meta.inactiveFrom && registoSel.date >= meta.inactiveFrom);
+      const isDeactivatedToday = isDeactivatable && !isEntityActiveForDate(op, ent, registoSel.date);
+      const histInactive = !isEntityActiveForDate(op, ent, registoSel.date);
       const badge = isHistorical
-        ? (meta.inactiveFrom ? ` <span class="de-badge inactive" style="margin-left:4px;">desativado desde ${meta.inactiveFrom.split('-').reverse().join('/')}</span>` : ' <span class="de-badge inactive" style="margin-left:4px;">antigo</span>')
+        ? (histInactive ? ` <span class="de-badge inactive" style="margin-left:4px;">inativo nesta data</span>` : ' <span class="de-badge inactive" style="margin-left:4px;">antigo</span>')
         : '';
       let tds = `<td class="ent-name">${ent}${badge}${isHistorical?'':' <button class="de-rename-btn" data-rename-entity="'+ent+'" title="Renomear">✎</button>'}</td>`;
       if (hasLojas) tds += `<td class="ent-loja">${meta.loja||'—'} ${isHistorical?'':'<button class="de-rename-btn" data-rename-loja="'+ent+'" title="Editar loja">✎</button>'}</td>`;
@@ -1420,10 +1471,7 @@ function renderRegisto(){
     // Lista de desativados sempre visível, independente da data selecionada no
     // Registo — corrige o caso de não conseguir reativar quem está inativo há
     // meses (antes só aparecia se a data escolhida caísse no período ativo).
-    const inactiveEntities = op.repeating.entities.filter(ent=>{
-      const m = (op.repeating.entityMeta||{})[ent];
-      return m && m.inactiveFrom;
-    });
+    const inactiveEntities = op.repeating.entities.filter(ent=>isEntityCurrentlyInactive(op, ent));
     if (inactiveEntities.length){
       const inactiveCard = document.createElement('div');
       inactiveCard.className = 'de-card';
@@ -1435,10 +1483,11 @@ function renderRegisto(){
         const list = document.createElement('div');
         list.style.cssText = 'display:flex;flex-direction:column;gap:8px;margin-top:12px;';
         inactiveEntities.forEach(ent=>{
-          const meta = op.repeating.entityMeta[ent];
+          const period = currentInactivePeriod(op, ent);
+          const desde = period ? addDays(period.from,-1) : null; // mostra a data pedida pelo utilizador (o último dia ativo + 1 = from)
           const row = document.createElement('div');
           row.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 12px;background:var(--navy);border:1px solid var(--border);border-radius:8px;';
-          row.innerHTML = `<span>${ent} <span class="de-badge inactive" style="margin-left:4px;">desativado desde ${meta.inactiveFrom.split('-').reverse().join('/')}</span></span>
+          row.innerHTML = `<span>${ent} <span class="de-badge inactive" style="margin-left:4px;">desativado desde ${(period?period.from:desde||'').split('-').reverse().join('/')}</span></span>
             <button class="de-btn ghost small" data-reactivate-entity="${ent}">↺ Reativar</button>`;
           list.appendChild(row);
         });
@@ -1449,8 +1498,12 @@ function renderRegisto(){
       inactiveCard.querySelectorAll('[data-reactivate-entity]').forEach(btn=>{
         btn.onclick = async ()=>{
           const name = btn.dataset.reactivateEntity;
-          if (!confirm(`Reativar "${name}" em ${op.name}? Volta a aparecer no Registo a partir de hoje.`)) return;
-          delete op.repeating.entityMeta[name].inactiveFrom;
+          if (!confirm(`Reativar "${name}" em ${op.name}? Volta a aparecer no Registo a partir de hoje. Os dias em que esteve desativado não vão gerar alertas de dados em falta.`)) return;
+          const meta = op.repeating.entityMeta[name];
+          if (!meta.inactivePeriods) meta.inactivePeriods = meta.inactiveFrom ? [{from: addDays(meta.inactiveFrom,1), to:null}] : [];
+          delete meta.inactiveFrom;
+          const open = meta.inactivePeriods.find(p=>!p.to);
+          if (open) open.to = todayISO();
           await saveOperations(STATE.operations);
           await logEdit('Reativou '+op.repeating.entityLabel.toLowerCase(), op.name + ' — ' + name);
           toast(`${name} reativado`);
@@ -1463,9 +1516,11 @@ function renderRegisto(){
       const val = card.querySelector('#quick-add-entity').value.trim();
       if (!val) return;
       op.repeating.entities.push(val);
+      op.repeating.entityMeta = op.repeating.entityMeta || {};
+      op.repeating.entityMeta[val] = { ...(op.repeating.entityMeta[val]||{}), createdFrom: registoSel.date };
       await saveOperations(STATE.operations);
-      await logEdit('Adicionou '+op.repeating.entityLabel.toLowerCase(), op.name + ' — ' + val);
-      toast(`${op.repeating.entityLabel} adicionado: ${val}`);
+      await logEdit('Adicionou '+op.repeating.entityLabel.toLowerCase(), op.name + ' — ' + val + ' — a partir de ' + registoSel.date);
+      toast(`${op.repeating.entityLabel} adicionado a partir de ${registoSel.date.split('-').reverse().join('/')}`);
       render();
     };
     card.querySelector('#reg-disable-repeating').onclick = async ()=>{
@@ -1501,16 +1556,25 @@ function renderRegisto(){
           }
           if (!op.repeating.entityMeta) op.repeating.entityMeta = {};
           op.repeating.entityMeta[name] = op.repeating.entityMeta[name] || {};
-          op.repeating.entityMeta[name].inactiveFrom = registoSel.date;
+          const meta = op.repeating.entityMeta[name];
+          if (!meta.inactivePeriods) meta.inactivePeriods = meta.inactiveFrom ? [{from: addDays(meta.inactiveFrom,1), to:null}] : [];
+          delete meta.inactiveFrom;
+          meta.inactivePeriods.push({ from: addDays(registoSel.date,1), to: null });
           await saveOperations(STATE.operations);
           await logEdit('Desativou '+op.repeating.entityLabel.toLowerCase(), op.name + ' — ' + name + ' — a partir de ' + registoSel.date);
           toast(`${name} marcado como desativado a partir de ${dataFmt}`);
         } else {
-          if (!confirm(`Reativar "${name}" em ${op.name}? Volta a aparecer no Registo a partir de hoje.`)){
+          if (!confirm(`Reativar "${name}" em ${op.name}? Volta a aparecer no Registo a partir de hoje. Os dias em que esteve desativado não vão gerar alertas de dados em falta.`)){
             cb.checked = true;
             return;
           }
-          if (op.repeating.entityMeta && op.repeating.entityMeta[name]) delete op.repeating.entityMeta[name].inactiveFrom;
+          const meta = op.repeating.entityMeta && op.repeating.entityMeta[name];
+          if (meta){
+            if (!meta.inactivePeriods) meta.inactivePeriods = meta.inactiveFrom ? [{from: addDays(meta.inactiveFrom,1), to:null}] : [];
+            delete meta.inactiveFrom;
+            const open = meta.inactivePeriods.find(p=>!p.to);
+            if (open) open.to = todayISO();
+          }
           await saveOperations(STATE.operations);
           await logEdit('Reativou '+op.repeating.entityLabel.toLowerCase(), op.name + ' — ' + name);
           toast(`${name} reativado`);
@@ -2108,9 +2172,10 @@ function renderAnual(wrap){
   const totalGeralAno = months.reduce((s,x)=>s+x.total,0);
   const edrAno = totalGeralAno>0 ? totalAno/totalGeralAno : null;
   const first = months[0], last = months[months.length-1];
+  const prevMonthObj = months.length>1 ? months[months.length-2] : null;
   let trendPct = null;
-  if (first && last && first.ent>0 && months.length>1) trendPct = (last.compEnt-first.ent)/first.ent;
-  const trendLabel = last && last.isProjected ? `Tendência ${monthName(first?first.m:1)}→${monthName(last?last.m:1)} (projetado)` : `Tendência ${monthName(first?first.m:1)}→${monthName(last?last.m:1)}`;
+  if (prevMonthObj && prevMonthObj.ent>0) trendPct = (last.compEnt-prevMonthObj.ent)/prevMonthObj.ent;
+  const trendLabel = last && last.isProjected ? `Tendência ${monthName(last.m)} (projetado) vs ${monthName(prevMonthObj?prevMonthObj.m:last.m)}` : `Tendência ${monthName(last?last.m:1)} vs mês anterior`;
   kpis.innerHTML = `
     <div class="de-kpi"><div class="label">📦 Total entregues (ano)</div><div class="value green">${fmt(totalAno)}</div></div>
     <div class="de-kpi"><div class="label">🎯 EDR médio (ano)</div><div class="value">${edrAno!==null?edrHtml(edrAno):'—'}</div></div>
@@ -2394,12 +2459,14 @@ function renderPorCliente(wrap){
   });
 
   const curMonth = Number(allDates[allDates.length-1].slice(5,7));
-  const curDates = allDates.filter(d=>Number(d.slice(5,7))===curMonth);
-  const prevDates = allDates.filter(d=>Number(d.slice(5,7))===curMonth-1);
+  const curYear = Number(allDates[allDates.length-1].slice(0,4));
+  const curDates = allDates.filter(d=>d.slice(0,7)===curYear+'-'+String(curMonth).padStart(2,'0'));
+  const prevDates = allDates.filter(d=>Number(d.slice(5,7))===curMonth-1 && d.startsWith(String(curYear)));
   const curStats = computeOpRangeStats(op, curDates, entityFilter);
   const prevStats = computeOpRangeStats(op, prevDates, entityFilter);
+  const curProj = projectMonthEntregues(curStats, curYear, curMonth);
   let momChange = null;
-  if (prevStats.entregues>0) momChange = (curStats.entregues-prevStats.entregues)/prevStats.entregues;
+  if (prevStats.entregues>0) momChange = (curProj.value-prevStats.entregues)/prevStats.entregues;
 
   const overallStats = computeOpRangeStats(op, allDates, entityFilter);
 
@@ -2410,7 +2477,7 @@ function renderPorCliente(wrap){
     <div class="de-kpi"><div class="label">🎯 EDR histórico</div><div class="value">${overallStats.edr!==null?edrHtml(overallStats.edr):'—'}</div></div>
     <div class="de-kpi"><div class="label">🌟 Melhor dia da semana</div><div class="value" style="font-size:16px;">${bestWd?bestWd.w+' ('+edrHtml(bestWd.edr)+')':'—'}</div></div>
     <div class="de-kpi"><div class="label">⚠️ Pior dia da semana</div><div class="value" style="font-size:16px;">${worstWd?worstWd.w+' ('+edrHtml(worstWd.edr)+')':'—'}</div></div>
-    <div class="de-kpi"><div class="label">🔁 Vs. mês anterior</div><div class="value ${momChange>0?'green':momChange<0?'red':''}">${momChange!==null?(momChange>=0?'+':'')+pct(momChange):'—'}</div></div>
+    <div class="de-kpi"><div class="label">🔁 Vs. mês anterior${curProj.isProjected?' <span title="Mês em curso — projeção de fecho com base nos '+curProj.dias+' dias já registados" style="cursor:help;">📊</span>':''}</div><div class="value ${momChange>0?'green':momChange<0?'red':''}">${momChange!==null?(momChange>=0?'+':'')+pct(momChange):'—'}</div></div>
   `;
   wrap.appendChild(kpis);
 
@@ -3103,9 +3170,9 @@ function renderOpEditor(op){
       const loja = repBox.querySelector('#new-entity-loja').value.trim();
       if (!val) return;
       op.repeating.entities.push(val);
-      if (loja) op.repeating.entityMeta[val] = { loja };
+      op.repeating.entityMeta[val] = { ...(loja?{loja}:{}) , createdFrom: todayISO() };
       await saveOperations(STATE.operations);
-      await logEdit('Adicionou '+op.repeating.entityLabel.toLowerCase()+' (config)', op.name + ' — ' + val);
+      await logEdit('Adicionou '+op.repeating.entityLabel.toLowerCase()+' (config)', op.name + ' — ' + val + ' — a partir de ' + todayISO());
       render();
     };
     repBox.querySelectorAll('[data-remove-entity]').forEach(btn=>{
