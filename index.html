@@ -3460,8 +3460,15 @@ function migrateOperations(ops){
       const totalFieldsVR = op.repeating.fields.filter(f=>f.role==='total');
       if (totalFieldsVR.length > 1) totalFieldsVR.slice(1).forEach(f=>{ f.role=null; });
       if (!op.repeating.fields.some(f=>f.key==='stops')){
-        op.repeating.fields.unshift({ key:'stops', label:'Stops Planeados', role:'total' });
+        op.repeating.fields.push({ key:'stops', label:'Stops Planeados', role:'total' });
       }
+      // ordem de preenchimento pedida: Stops Planeados (1ª coluna), Entregues (2ª)
+      const desiredOrderVR = ['stops','entregues'];
+      op.repeating.fields.sort((a,b)=>{
+        let ia = desiredOrderVR.indexOf(a.key); if (ia===-1) ia = 999;
+        let ib = desiredOrderVR.indexOf(b.key); if (ib===-1) ib = 999;
+        return ia-ib;
+      });
     }
     // Correção DHL Express: remove o campo legado "Entregas" (que ficava
     // duplicado com "Stops Planeados" e inflacionava o total usado no EDR).
