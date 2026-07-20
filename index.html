@@ -373,6 +373,9 @@ function chartGreen(){ return currentTheme==='light' ? '#0f9d63' : '#38c793'; }
 function chartLabelText(){ return currentTheme==='light' ? '#0d1b33' : '#eaf0fb'; }
 
 let valueLabelsRegistered = false;
+function deLabelBoxesOverlap(a,b){
+  return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+}
 const valueLabelsPlugin = {
   id: 'deValueLabels',
   afterDatasetsDraw(chart){
@@ -384,6 +387,22 @@ const valueLabelsPlugin = {
       const tb = chart.getDatasetMeta(b).type === 'line' ? 1 : 0;
       return ta-tb;
     });
+    // Guarda as caixas já "ocupadas" neste render para nunca deixar duas
+    // labels (ex: nº da barra e % da linha) ficarem sobrepostas. Começa já
+    // com uma pequena zona reservada à volta de cada ponto da(s) linha(s) —
+    // assim nenhuma label (nem a da própria barra) fica riscada por cima do
+    // traço da linha quando a barra é muito alta e quase toca nela.
+    const placedBoxes = [];
+    chart.data.datasets.forEach((ds, i)=>{
+      const m = chart.getDatasetMeta(i);
+      if (m.hidden || m.type !== 'line') return;
+      m.data.forEach(el=>{
+        const p = el.tooltipPosition ? el.tooltipPosition() : el.getCenterPoint();
+        const r = 7;
+        placedBoxes.push({ left: p.x-r, right: p.x+r, top: p.y-r, bottom: p.y+r });
+      });
+    });
+    const minBoxTop = chart.chartArea.top + 2;
     order.forEach(dsIndex=>{
       const dataset = chart.data.datasets[dsIndex];
       const meta = chart.getDatasetMeta(dsIndex);
@@ -400,16 +419,43 @@ const valueLabelsPlugin = {
         ctx.textAlign = 'center';
         const textColor = isLine ? (dataset.borderColor || chartGreen()) : chartLabelText();
         const pos = element.tooltipPosition ? element.tooltipPosition() : element.getCenterPoint();
-        ctx.textBaseline = 'bottom';
         const offset = isLine ? 14 : 6;
-        const ty = pos.y - offset;
-        // Fundo (chip) atrás do texto, para não se perder sobre barras/linhas
         const textW = ctx.measureText(label).width;
         const padX = 4, padY = 2, boxH = 13;
+
+        // O número da barra fica sempre por dentro dela (perto do topo) —
+        // assim nunca disputa espaço nem cruza com a linha do EDR% por cima.
+        const insideBar = !isLine;
+
+        let ty, box;
+        if (insideBar){
+          ctx.textBaseline = 'top';
+          ty = pos.y + 6;
+          box = { left: pos.x-textW/2-padX, right: pos.x+textW/2+padX, top: ty-padY, bottom: ty+boxH-padY };
+        } else {
+          ctx.textBaseline = 'bottom';
+          ty = pos.y - offset;
+          // Nunca deixar a label (nem o seu fundo) invadir a área acima do
+          // gráfico (legenda/título) — se o ponto estiver perto do topo,
+          // "empurra-se" a label para baixo até caber dentro da área do chart.
+          if (ty - boxH + padY < minBoxTop){ ty = minBoxTop + boxH - padY; }
+          box = { left: pos.x-textW/2-padX, right: pos.x+textW/2+padX, top: ty-boxH+padY, bottom: ty+padY };
+          // Se esta label colidir com outra já desenhada (ex: % da linha em
+          // cima do número da barra), sobe-a um pouco até deixar de colidir.
+          let guard = 0;
+          while (guard < 10 && placedBoxes.some(b=>deLabelBoxesOverlap(b, box))){
+            ty -= (boxH + 2);
+            if (ty - boxH + padY < minBoxTop){ ty = minBoxTop + boxH - padY; box = { left: box.left, right: box.right, top: ty-boxH+padY, bottom: ty+padY }; break; }
+            box = { left: pos.x-textW/2-padX, right: pos.x+textW/2+padX, top: ty-boxH+padY, bottom: ty+padY };
+            guard++;
+          }
+        }
+        placedBoxes.push(box);
+        // Fundo (chip) atrás do texto, para não se perder sobre barras/linhas
         ctx.fillStyle = currentTheme==='light' ? 'rgba(255,255,255,0.88)' : 'rgba(10,18,36,0.82)';
         ctx.beginPath();
-        if (ctx.roundRect){ ctx.roundRect(pos.x-textW/2-padX, ty-boxH+padY, textW+padX*2, boxH, 4); }
-        else { ctx.rect(pos.x-textW/2-padX, ty-boxH+padY, textW+padX*2, boxH); }
+        if (ctx.roundRect){ ctx.roundRect(box.left, box.top, box.right-box.left, box.bottom-box.top, 4); }
+        else { ctx.rect(box.left, box.top, box.right-box.left, box.bottom-box.top); }
         ctx.fill();
         ctx.fillStyle = textColor;
         ctx.fillText(label, pos.x, ty);
