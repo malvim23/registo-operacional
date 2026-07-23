@@ -441,6 +441,20 @@ const valueLabelsPlugin = {
           ctx.textBaseline = 'top';
           ty = pos.y + 6;
           box = { left: pos.x-textW/2-padX, right: pos.x+textW/2+padX, top: ty-padY, bottom: ty+boxH-padY };
+        } else if (isLine && (pos.y - offset - boxH + padY) < minBoxTop){
+          // Não há espaço para desenhar acima do ponto (linha perto do topo
+          // do gráfico) — em vez de comprimir a label contra o limite (o que
+          // a fazia ficar em cima da própria linha), desenha-se por baixo
+          // do ponto.
+          ctx.textBaseline = 'top';
+          ty = pos.y + 8;
+          box = { left: pos.x-textW/2-padX, right: pos.x+textW/2+padX, top: ty-padY, bottom: ty+boxH-padY };
+          let guardB = 0;
+          while (guardB < 10 && placedBoxes.some(b=>deLabelBoxesOverlap(b, box))){
+            ty += (boxH + 2);
+            box = { left: pos.x-textW/2-padX, right: pos.x+textW/2+padX, top: ty-padY, bottom: ty+boxH-padY };
+            guardB++;
+          }
         } else {
           ctx.textBaseline = 'bottom';
           ty = pos.y - offset;
@@ -2312,7 +2326,7 @@ function renderMensal(wrap){
   safeChart('an-trend', {
     data:{ labels: perDay.map(d=>d.date.slice(8)), datasets:[
       { type:'bar', label:'Entregues', data: perDay.map(d=>d.hasData?d.ent:null), backgroundColor:chartBlue(), borderRadius:4, yAxisID:'y', order:2 },
-      { type:'line', label:'EDR%', data: perDay.map(d=>d.hasData && d.total>0 ? (d.ent/d.total*100) : null), borderColor:chartGreen(), backgroundColor:chartGreen(), tension:0.3, yAxisID:'y1', pointRadius:2, labelSuffix:'%', hideLabels:true, order:1 }
+      { type:'line', label:'EDR%', data: perDay.map(d=>d.hasData && d.total>0 ? (d.ent/d.total*100) : null), borderColor:chartGreen(), backgroundColor:chartGreen(), tension:0.3, yAxisID:'y1', pointRadius:2, labelSuffix:'%', order:1 }
     ]},
     options:{ responsive:true, plugins:{legend:{labels:{color:chartLegend()}}},
       scales:{
@@ -2777,7 +2791,7 @@ function renderPorCliente(wrap){
       labels: chartLabels,
       datasets: [
         { type:'bar', label:'Entregues', data: chartEnt, backgroundColor:chartBlue(), yAxisID:'y', hideLabels: chartLabels.length>31, order:2 },
-        { type:'line', label:'EDR%', data: chartEdr, borderColor:chartGreen(), yAxisID:'y1', pointRadius: groupBy==='day'?1:3, tension:0.3, labelSuffix:'%', hideLabels: groupBy==='day', order:1 }
+        { type:'line', label:'EDR%', data: chartEdr, borderColor:chartGreen(), yAxisID:'y1', pointRadius: groupBy==='day'?1:3, tension:0.3, labelSuffix:'%', hideLabels: chartLabels.length>31, order:1 }
       ]
     },
     options:{
